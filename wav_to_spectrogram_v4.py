@@ -9,9 +9,16 @@ from airflow.operators.python import PythonOperator
 from datetime import datetime, timedelta
 from skimage.transform import resize
 
+from airflow import Dataset
+
+import zipfile
+
 ## 로컬에 저장한 후
 # spectrogram 폴더를 압축한 뒤 s3에 업로드
 ## 향후 s3에 저장된 압축파일을 다운받아서 모델 학습할 수 있게 설정
+
+
+saved_data = Dataset('/Users/yoohajun/Desktop/grad_audio/output/spectrogram_fixed.zip')
 
 # train data가 저장되어 있는 장소
 source_path = '/Users/yoohajun/Desktop/grad_audio/source'
@@ -21,13 +28,12 @@ output_path = '/Users/yoohajun/Desktop/grad_audio/output'
 # Define the output directory for the spectrogram, mfcc images
 spec_dir = os.path.join(output_path, 'spectrogram_fixed')
 
-
 default_args = {
     'owner': 'airflow',
     'depends_on_past': False,
     'catchup': False,
     # 'schedule_interval': '* */1 * * *',
-    'schedule_interval': '@daily',
+    'schedule_interval': '@once',
     'start_date': datetime(2023, 4, 1),
     'retries': 1,
     'retry_delay': timedelta(minutes=3)
@@ -61,6 +67,7 @@ def random_pad(mels, pad_size, mfcc=True):
         mels = np.pad(mels, pad_width=((0, 0), (left, right)), mode='constant')
 
     return mels
+
 
 # Load the audio files
 def generate_spectrogram(subdir, audio_dir, img_height, img_width):
@@ -118,19 +125,29 @@ create_spec_dir = BashOperator(
 )
 
 # Define the BashOperator to create a compressed zip file
-create_zip_file = BashOperator(
+# create_zip_file = BashOperator(
+#     task_id='create_zip_file',
+#     bash_command=f'cd {output_path} && zip -r spectrogram_fixed.zip spectrogram_fixed',
+#     dag=dag
+# )
+
+def create_zip(output_path: str):
+    with zipfile.ZipFile(output_path + '/spectrogram_fixed.zip', 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        zip_file.write(output_path + '/spectrogram_fixed')
+
+
+create_zip_file = PythonOperator(
     task_id='create_zip_file',
-    bash_command=f'cd {output_path} && zip -r spectrogram_fixed.zip spectrogram_fixed',
+    python_callable=create_zip,
+    outlets=[saved_data],
+    op_kwargs={'output_path': output_path},
     dag=dag
 )
-
-
 
 # Define the PythonOperator that creates the data directories and runs the generate_spectrogram function
 folders = ['robbery', 'theft', 'exterior', 'interior', 'sexual', 'violence', 'help']
 
 for folder in folders:
-
     data_dir = os.path.join(source_path, folder, 'train')
 
     create_source_dir = BashOperator(
