@@ -10,7 +10,8 @@ from datetime import datetime, timedelta
 from skimage.transform import resize
 
 ## 로컬에 저장한 후
-## 해당 내용을 s3에 업로드하게 하기
+# spectrogram 폴더를 압축한 뒤 s3에 업로드
+## 향후 s3에 저장된 압축파일을 다운받아서 모델 학습할 수 있게 설정
 
 # train data가 저장되어 있는 장소
 source_path = '/Users/yoohajun/Desktop/grad_audio/source'
@@ -25,9 +26,9 @@ default_args = {
     'owner': 'airflow',
     'depends_on_past': False,
     'catchup': False,
-    'schedule_interval': '* */1 * * *',
-    # 'schedule_interval': '@daily',
-    'start_date': datetime(2023, 3, 8),
+    # 'schedule_interval': '* */1 * * *',
+    'schedule_interval': '@daily',
+    'start_date': datetime(2023, 4, 1),
     'retries': 1,
     'retry_delay': timedelta(minutes=3)
 }
@@ -116,6 +117,15 @@ create_spec_dir = BashOperator(
     dag=dag
 )
 
+# Define the BashOperator to create a compressed zip file
+create_zip_file = BashOperator(
+    task_id='create_zip_file',
+    bash_command=f'cd {output_path} && zip -r spectrogram_fixed.zip spectrogram_fixed',
+    dag=dag
+)
+
+
+
 # Define the PythonOperator that creates the data directories and runs the generate_spectrogram function
 folders = ['robbery', 'theft', 'exterior', 'interior', 'sexual', 'violence', 'help']
 
@@ -148,4 +158,4 @@ for folder in folders:
     )
 
     # Set the dependencies between tasks
-    create_spec_dir >> create_source_dir >> generate_spectrogram_task
+    create_spec_dir >> create_source_dir >> generate_spectrogram_task >> create_zip_file
