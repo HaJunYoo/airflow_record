@@ -6,12 +6,16 @@ import matplotlib.pyplot as plt
 from airflow import DAG
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
+# from airflow.sensors.external_task import ExternalTaskSensor
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+
 from datetime import datetime, timedelta
 from skimage.transform import resize
 
 from airflow import Dataset
 
 import zipfile
+import math
 
 ## 로컬에 저장한 후
 # spectrogram 폴더를 압축한 뒤 s3에 업로드
@@ -31,15 +35,15 @@ spec_dir = os.path.join(output_path, 'spectrogram_fixed')
 default_args = {
     'owner': 'airflow',
     'depends_on_past': False,
-    'catchup': False,
+    'catchup': True,
     # 'schedule_interval': '* */1 * * *',
     'schedule_interval': '@once',
-    'start_date': datetime(2023, 4, 1),
+    'start_date': datetime(2023, 4, 11),
     'retries': 1,
     'retry_delay': timedelta(minutes=3)
 }
 
-dag = DAG('audio_to_spectrogram_v4', default_args=default_args)
+dag = DAG('audio_to_spectrogram_situation', default_args=default_args)
 
 
 def random_pad(mels, pad_size, mfcc=True):
@@ -68,9 +72,8 @@ def random_pad(mels, pad_size, mfcc=True):
 
     return mels
 
-
 # Load the audio files
-def generate_spectrogram(subdir, audio_dir, img_height, img_width):
+def generate_spectrogram(subdir, audio_dir, img_height, img_width, seconds_per_spec):
     # Create the output directory for the spectrogram images under the subdir/data directory
     spec_dir_2 = os.path.join(spec_dir, subdir)
     if not os.path.exists(spec_dir_2):
@@ -90,29 +93,37 @@ def generate_spectrogram(subdir, audio_dir, img_height, img_width):
             filepath = os.path.join(audio_dir, filename)
             y, sr = librosa.load(filepath, sr=44100)
 
-            # Generate the spectrogram
-            mels = librosa.feature.melspectrogram(y=y, sr=sr)
-            mels_db = librosa.power_to_db(mels, ref=np.max)
+            # Calculate the number of spectrograms to generate based on seconds_per_spec
+            num_specs = math.ceil(len(y) / (sr * seconds_per_spec))
 
-            # for the incremental update
-            for i in range(repeat_size):
-                spec_filename = f'{filename[:-4]}_{i + 1}.png'
+            for i in range(num_specs):
+                start = int(i * sr * seconds_per_spec)
+                end = int(min(start + sr * seconds_per_spec, len(y)))
+                y_slice = y[start:end]
 
-                if spec_filename in os.listdir(spec_dir_2):
-                    print(f'{subdir} : {idx + 1}, {spec_filename} -> exists')
-                    continue
-                else:
-                    ## padding
-                    mels_db = random_pad(mels_db, pad_size=pad_size, mfcc=False)
+                # Generate the spectrogram
+                mels = librosa.feature.melspectrogram(y=y_slice, sr=sr)
+                mels_db = librosa.power_to_db(mels, ref=np.max)
 
-                    # Resize the spectrogram to the fixed shape
-                    mels_resized = resize(mels_db, target_shape)
+                # for the incremental update
+                for j in range(repeat_size):
+                    spec_filename = f'{filename[:-4]}_{i + 1}_{j + 1}.png'
 
-                    # Save the spectrogram as an image file
-                    spec_filepath = os.path.join(spec_dir_2, spec_filename)
-                    plt.imsave(spec_filepath, mels_resized)
+                    if spec_filename in os.listdir(spec_dir_2):
+                        print(f'{subdir} : {idx + 1}, {spec_filename} -> exists')
+                        continue
+                    else:
+                        ## padding
+                        mels_db = random_pad(mels_db, pad_size=pad_size, mfcc=False)
 
-                    print(f'{subdir} : {idx + 1}, {spec_filename} -> saved')
+                        # Resize the spectrogram to the fixed shape
+                        mels_resized = resize(mels_db, target_shape)
+
+                        # Save the spectrogram as an image file
+                        spec_filepath = os.path.join(spec_dir_2, spec_filename)
+                        plt.imsave(spec_filepath, mels_resized)
+
+                        print(f'{subdir} : {idx + 1}, {spec_filename} -> saved')
 
     print(f'Finished processing audio files in directory {audio_dir}')
 
@@ -144,8 +155,32 @@ create_zip_file = PythonOperator(
     dag=dag
 )
 
+# 외부 DAG의 ID와 작업 ID를 설정
+EXTERNAL_DAG_ID = 'audio_to_spectrogram_inex'  # 외부 DAG의 ID
+# EXTERNAL_TASK_ID = 'finish_task'  # 외부 DAG의 작업 ID
+
+# # 외부 DAG의 작업이 완료될 때까지 대기하는 ExternalTaskSensor 설정
+# wait_for_external_task = ExternalTaskSensor(
+#     task_id='wait_for_external_task',
+#     external_dag_id=EXTERNAL_DAG_ID,  # 외부 DAG의 ID
+#     external_task_id=EXTERNAL_TASK_ID,  # 외부 DAG의 작업 ID
+#     mode='poke',  # 대기 모드를 'poke'로 설정
+#     dag=dag
+# )
+
+wait_for_external_task = TriggerDagRunOperator(
+    trigger_dag_id=EXTERNAL_DAG_ID,
+    task_id='wait_for_external_task',
+    execution_date='{{ execution_date }}',
+    wait_for_completion=True,
+    poke_interval=30,
+    reset_dag_run=True,
+    dag=dag
+)
+
+
 # Define the PythonOperator that creates the data directories and runs the generate_spectrogram function
-folders = ['robbery', 'theft', 'exterior', 'interior', 'sexual', 'violence', 'help']
+folders = ['robbery', 'theft', 'sexual', 'violence', 'help', 'regular_note']
 
 for folder in folders:
     data_dir = os.path.join(source_path, folder, 'train')
@@ -169,10 +204,11 @@ for folder in folders:
             'subdir': folder,
             'audio_dir': audio_dir,
             'img_height': 128,
-            'img_width': 128
+            'img_width': 128,
+            'seconds_per_spec': 5
         },
         dag=dag
     )
 
     # Set the dependencies between tasks
-    create_spec_dir >> create_source_dir >> generate_spectrogram_task >> create_zip_file
+    create_spec_dir >> create_source_dir >> generate_spectrogram_task >> wait_for_external_task >> create_zip_file
